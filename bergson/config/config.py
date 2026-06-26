@@ -314,6 +314,10 @@ class TrainingConfig(AttributionConfig, Serializable):
     weight_decay: float = 0.01
     """Weight decay coefficient for AdamW and Muon."""
 
+    max_grad_norm: float | None = None
+    """Clip gradients to this global norm before each optimizer step, matching
+    HuggingFace Trainer's ``max_grad_norm``. ``None`` or ``0`` disables clipping."""
+
     grad_checkpointing: bool = False
     """Whether to use gradient checkpointing during the forward pass."""
 

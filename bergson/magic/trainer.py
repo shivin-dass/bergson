@@ -21,6 +21,7 @@ from torch.distributed._functional_collectives import (
 from torch.distributed._functional_collectives import (
     wait_tensor,
 )
+from torch.distributed.tensor import DTensor, Replicate
 from torchopt.pytree import tree_flatten_with_path, tree_iter, tree_map
 from torchopt.typing import GradientTransformation, OptState
 from tqdm.auto import tqdm
@@ -246,6 +247,7 @@ class Trainer:
         cls,
         model: nn.Module,
         optimizer: GradientTransformation,
+        max_grad_norm: float | None = None,
     ) -> tuple["Trainer", TrainerState]:
         """Convenience method for initializing the trainer and state."""
         # Create new tensor objects for the parameters and buffers to ensure that they
@@ -262,9 +264,14 @@ class Trainer:
         opt_state = optimizer.init(params)
 
         state = TrainerState(params, opt_state, buffers)
-        return cls(model, optimizer), state
+        return cls(model, optimizer, max_grad_norm), state
 
-    def __init__(self, model: nn.Module, optimizer: GradientTransformation):
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer: GradientTransformation,
+        max_grad_norm: float | None = None,
+    ):
         # Move only trainable parameters to the meta device, leaving frozen params
         # on device so they don't need to be managed by TrainerState.
         for mod in model.modules():
@@ -276,6 +283,7 @@ class Trainer:
 
         self.model = model
         self.optimizer = optimizer
+        self.max_grad_norm = max_grad_norm
 
     def step(
         self,
@@ -343,6 +351,26 @@ class Trainer:
             else:
                 for g in grads.values():
                     dist.all_reduce(g, op=dist.ReduceOp.AVG)
+
+        # Global-norm gradient clipping, matching HF Trainer's max_grad_norm. Applied
+        # between the cross-rank reduce and the optimizer so the clipped grads drive the
+        # update, with the norm taken over all params and all ranks/FSDP shards.
+        if self.max_grad_norm:
+            sq_norm = sum(g.pow(2).sum() for g in grads.values())
+            if isinstance(sq_norm, DTensor):
+                # Under FSDP the grads are sharded DTensors, so the squared norm is a
+                # partial sum over each rank's shard; redistribute to Replicate to sum
+                # it across the mesh. This is autograd-aware, so it also works under
+                # trace. (In the non-FSDP path the all-reduce above already replicated
+                # the grads, so the local sum is already global.)
+                sq_norm = sq_norm.redistribute(placements=[Replicate()])
+            coef = (self.max_grad_norm / (sq_norm.sqrt() + 1e-6)).clamp(max=1.0)
+            if trace:
+                # Out-of-place to preserve autograd; the in-place path breaks the graph.
+                grads = {k: g * coef for k, g in grads.items()}
+            else:
+                for g in grads.values():
+                    g.mul_(coef)
 
         updates, new_state = self.optimizer.update(
             grads, state.opt_state, inplace=inplace, params=state.params

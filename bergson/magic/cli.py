@@ -188,7 +188,7 @@ def prepare_trainer(cfg: TrainingConfig, rank: int, schedule: Callable):
         case other:
             raise ValueError(f"Unsupported optimizer: {other}")
 
-    trainer, fwd_state = Trainer.initialize(model, opt)
+    trainer, fwd_state = Trainer.initialize(model, opt, cfg.max_grad_norm)
     return trainer, fwd_state, model
 
 
