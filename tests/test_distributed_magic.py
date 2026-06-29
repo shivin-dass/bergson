@@ -63,9 +63,9 @@ def test_fsdp_ddp_scores_match():
         ddp_scores = torch.load(f"{tmpdir}/ddp/scores.pt", weights_only=True)
         fsdp_scores = torch.load(f"{tmpdir}/fsdp/scores.pt", weights_only=True)
 
-    assert fsdp_scores.shape == ddp_scores.shape, (
-        f"Shape mismatch: FSDP {fsdp_scores.shape} vs DDP {ddp_scores.shape}"
-    )
+    assert (
+        fsdp_scores.shape == ddp_scores.shape
+    ), f"Shape mismatch: FSDP {fsdp_scores.shape} vs DDP {ddp_scores.shape}"
 
     atol = 1e-4
     rtol = 1e-3
