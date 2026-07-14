@@ -38,6 +38,25 @@ class DataStream:
     def requires_grad(self, value: bool):
         self.weights.requires_grad = value
 
+    def _prepare_batch(self, batch):
+        """Convert batch to tensors. Override this method for non-token data.
+
+        Args:
+            batch: Dict from dataset[indices], containing data columns
+
+        Returns:
+            Tuple of (x, y, valid_mask) where:
+                x: Input tensor (e.g., observations, input_ids)
+                y: Label tensor (e.g., actions, labels)
+                valid_mask: Boolean tensor indicating valid positions
+        """
+        x, y, valid_mask = pad_and_tensor(
+            batch["input_ids"],
+            labels=batch.get("labels"),
+            device=self.device,
+        )
+        return x, y, valid_mask
+
     def __getitem__(self, i: int) -> dict:
         if i < 0 or i >= len(self):
             raise IndexError("DataStream index out of range")
@@ -49,11 +68,8 @@ class DataStream:
         indices = list(rng)[self.rank :: self.world_size]
 
         batch = self.dataset[indices]
-        x, y, valid_mask = pad_and_tensor(
-            batch["input_ids"],
-            labels=batch.get("labels"),
-            device=self.device,
-        )
+        x, y, valid_mask = self._prepare_batch(batch)
+
         # If the weights are 1D, we assume they correspond to documents and look for
         # "doc_ids" in the batch to index them. If they're 2D, they correspond to tokens
         if self.weights.ndim == 2:
