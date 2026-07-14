@@ -3,11 +3,54 @@ from pathlib import Path
 
 import torch
 from huggingface_hub import hf_hub_download
-from huggingface_hub.utils import parse_hf_uri
 from peft import PeftModel, get_peft_model_state_dict
 from transformers import PreTrainedModel
 
 from bergson.gradients import AdafactorNormalizer, AdamNormalizer, Normalizer
+
+# Compatibility shim for older huggingface_hub versions
+try:
+    from huggingface_hub.utils import parse_hf_uri
+except ImportError:
+    # Simple implementation for huggingface-hub < 1.0
+    from dataclasses import dataclass
+
+    @dataclass
+    class HfUri:
+        id: str
+        revision: str | None
+        path_in_repo: str
+        type: str | None
+
+    def parse_hf_uri(uri: str) -> HfUri:
+        """Parse hf:// URIs for older huggingface_hub versions."""
+        if not uri.startswith("hf://"):
+            raise ValueError(f"URI must start with 'hf://': {uri}")
+
+        uri = uri[5:]  # Remove "hf://"
+
+        # Parse repo_type prefix (datasets/, spaces/, models/)
+        repo_type = None
+        for prefix, rtype in [("datasets/", "dataset"), ("spaces/", "space")]:
+            if uri.startswith(prefix):
+                repo_type = rtype
+                uri = uri[len(prefix):]
+                break
+
+        # Split repo_id and path
+        parts = uri.split("/", 2)
+        if len(parts) < 2:
+            raise ValueError(f"Invalid HF URI format: hf://{uri}")
+
+        repo_id = f"{parts[0]}/{parts[1]}"
+        path_in_repo = parts[2] if len(parts) > 2 else ""
+
+        # Parse revision from repo_id
+        revision = None
+        if "@" in repo_id:
+            repo_id, revision = repo_id.split("@", 1)
+
+        return HfUri(id=repo_id, revision=revision, path_in_repo=path_in_repo, type=repo_type)
 
 
 def load_optimizer(optimizer_state: str) -> dict:
