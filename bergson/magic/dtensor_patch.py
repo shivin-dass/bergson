@@ -166,8 +166,8 @@ def _patch_redistribute():
             grad_output,
             previous_spec,
             ctx.async_op,
-            ctx.backward_dtype,
-            ctx.original_dtype,
+            getattr(ctx, 'backward_dtype', None),
+            getattr(ctx, 'backward_dtype', None),
         )
         return (output_dtensor, None, None, None, None, None)
 

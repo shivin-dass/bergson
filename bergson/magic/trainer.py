@@ -135,7 +135,12 @@ class TrainerState:
             checkpoint_id=path,
         )
 
-    def save(self, path: str, debug_pbar: RtlTqdm | tqdm | None = None) -> SaveFuture:
+    def save(
+        self,
+        path: str,
+        debug_pbar: RtlTqdm | tqdm | None = None,
+        threads: int = 8,
+    ) -> SaveFuture:
         # Create a new process group so that we can overlap saves.
         if dist.is_initialized():
             with suppress_c_stdout():
@@ -148,9 +153,12 @@ class TrainerState:
             k: v.detach() if isinstance(v, torch.Tensor) else v
             for k, v in self.state_dict().items()
         }
+        # dcp.async_save's default writer uses a single IO thread, which
+        # can't keep up with per-step saves on slow filesystems (NFS).
         fut = dcp.async_save(
             state,
             checkpoint_id=path,
+            storage_writer=dcp.FileSystemWriter(path, thread_count=threads),
             process_group=grp,
         )
         assert isinstance(fut, Future)

@@ -76,10 +76,18 @@ def compute_query_gradients(
             grads = grad_tree(loss, params)
 
             if grad_accum is None:
-                grad_accum = {k: g.detach().clone() for k, g in grads.items()}
+                # Initialize: replace None with zeros for unused parameters
+                grad_accum = {}
+                for k, g in grads.items():
+                    if g is not None:
+                        grad_accum[k] = g.detach().clone()
+                    else:
+                        grad_accum[k] = torch.zeros_like(params[k])
             else:
                 for k, g in grads.items():
-                    grad_accum[k] += g.detach()
+                    if g is not None:
+                        grad_accum[k] += g.detach()
+                    # If g is None, grad_accum[k] stays as is (zeros)
 
             loss_accum += loss.detach()
 
