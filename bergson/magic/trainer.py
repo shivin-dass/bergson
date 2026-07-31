@@ -2,7 +2,7 @@ import math
 import os
 import time
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from shutil import rmtree
@@ -11,7 +11,6 @@ from typing import Any, cast
 import psutil
 import torch
 import torch.distributed as dist
-import torch.distributed.checkpoint as dcp
 import torch.distributed.tensor  # noqa: F401 — register DTensor for torch.load
 import torchopt
 from torch import nn
@@ -21,6 +20,7 @@ from torch.distributed._functional_collectives import (
 from torch.distributed._functional_collectives import (
     wait_tensor,
 )
+from torch.distributed.tensor import DTensor
 from torchopt.pytree import tree_flatten_with_path, tree_iter, tree_map
 from torchopt.typing import GradientTransformation, OptState
 from tqdm.auto import tqdm
@@ -34,18 +34,75 @@ from .rtl_tqdm import RtlTqdm
 from .swap import swap_parameters
 
 
-@contextmanager
-def suppress_c_stdout():
-    """Suppress C-level stdout."""
-    fd = os.dup(1)
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, 1)
-    os.close(devnull)
-    try:
-        yield
-    finally:
-        os.dup2(fd, 1)
-        os.close(fd)
+_SAVE_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _save_executor() -> ThreadPoolExecutor:
+    """Single background writer thread for checkpoint saves.
+
+    One worker is enough: callers already serialize saves (train() waits on the
+    pending save before issuing the next; backward() drains its futures before
+    each load), so extra workers would only add interleaving risk.
+    """
+    global _SAVE_EXECUTOR
+    if _SAVE_EXECUTOR is None:
+        _SAVE_EXECUTOR = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="ckpt_save"
+        )
+    return _SAVE_EXECUTOR
+
+
+def _rank_and_world() -> tuple[int, int]:
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def _rank_file(path: str, rank: int) -> str:
+    """This rank's shard file inside a step_N.ckpt checkpoint directory."""
+    return os.path.join(path, f"rank_{rank}.pt")
+
+
+def _is_local_main(rank: int) -> bool:
+    """True on one rank per node — the rank that owns node-local file cleanup.
+
+    Checkpoint shards live on node-local disks, so deletion must happen once
+    per node, not once globally (global rank 0 can't see other nodes' files).
+    Falls back to global rank 0 when LOCAL_RANK is unset (single-node spawn),
+    where per-node and global cleanup coincide.
+    """
+    local_rank = os.environ.get("LOCAL_RANK")
+    return rank == 0 if local_rank is None else int(local_rank) == 0
+
+
+def _consensus_valid_checkpoints(
+    ckpt_list: list[tuple[int, str]], rank: int
+) -> tuple[list[tuple[int, str]], list[str]]:
+    """Split checkpoints into (valid, locally-present-but-invalid paths).
+
+    A checkpoint is valid only if EVERY rank has its own shard file — a crash
+    mid-save can leave some ranks' (or a whole node's) files missing, and the
+    step_N.ckpt dirs themselves can exist on one node but not another. So each
+    rank shares its {step: has-my-shard} map and validity is the AND over the
+    union of steps seen anywhere; every rank returns the identical valid list.
+    """
+    local = {idx: os.path.exists(_rank_file(path, rank)) for idx, path in ckpt_list}
+
+    if dist.is_initialized():
+        world = dist.get_world_size()
+        all_maps: list[dict[int, bool] | None] = [None] * world
+        dist.all_gather_object(all_maps, local)
+        indices = sorted({i for m in all_maps if m for i in m})
+        agreed = {
+            i: all(m is not None and m.get(i, False) for m in all_maps) for i in indices
+        }
+    else:
+        agreed = local
+
+    paths = dict(ckpt_list)
+    valid = [(i, paths[i]) for i in sorted(agreed) if agreed[i] and i in paths]
+    invalid_local = [paths[i] for i in sorted(agreed) if not agreed[i] and i in paths]
+    return valid, invalid_local
 
 
 def _add(a: torch.Tensor | None, b: torch.Tensor | None) -> torch.Tensor | None:
@@ -74,16 +131,14 @@ def _maybe_get_cuda_rng_state() -> torch.Tensor:
 
 @dataclass
 class SaveFuture:
-    """Wraps a DCP async_save future, destroying the gloo process group in result().
+    """Wraps a background checkpoint-save future.
 
-    The group must be destroyed synchronously inside result() rather than in a
-    done_callback, because concurrent.futures.Future notifies result() waiters
-    before invoking callbacks — so a callback-based destroy races with the next
-    save() call creating a new group, leaking gloo sockets.
+    result() re-raises any exception from the writer thread, so a failed save
+    surfaces at the next synchronization point instead of silently producing a
+    checkpoint that is missing this rank's shard.
     """
 
     fut: Future
-    grp: dist.ProcessGroup | None
     debug_name: str = ""
     debug_pbar: RtlTqdm | tqdm | None = None
 
@@ -95,10 +150,6 @@ class SaveFuture:
         if self.debug_name and (not dist.is_initialized() or dist.get_rank() == 0):
             print_fn = self.debug_pbar.write if self.debug_pbar else print
             print_fn(f"Waiting for {self.debug_name} took {elapsed:.2f} seconds")
-
-        if self.grp is not None:
-            dist.destroy_process_group(self.grp)
-            self.grp = None
 
         return result
 
@@ -144,11 +195,37 @@ class TrainerState:
         return TrainerState(params, opt_state, buffers, self.batch_index)
 
     def load(self, path: str):
-        """Load state from a checkpoint file."""
-        dcp.load(
-            self.state_dict(),
-            checkpoint_id=path,
+        """Load state from this rank's shard file inside checkpoint dir `path`.
+
+        Each rank reads only its own `rank_{r}.pt` — no cross-rank or
+        cross-node filesystem access. Mirrors the old DCP semantics: tensors
+        are copied in-place into the current state (so callers holding
+        references keep them) and `batch_index` is NOT restored — callers
+        (resume(), backward()) set it explicitly before loading.
+        """
+        rank, world = _rank_and_world()
+        saved = torch.load(
+            _rank_file(path, rank), map_location="cpu", weights_only=True
         )
+
+        saved_world = int(saved.pop("__world_size"))
+        if saved_world != world:
+            raise RuntimeError(
+                f"Checkpoint {path} was saved at world_size={saved_world} but is "
+                f"being loaded at world_size={world}. Per-rank shard checkpoints "
+                "are same-run scratch and cannot be resharded."
+            )
+
+        state = self.state_dict()
+        with torch.no_grad():
+            for k, v in saved.items():
+                if k == ".batch_index":
+                    continue
+                target = state[k]
+                if isinstance(target, DTensor):
+                    target.to_local().copy_(v)
+                elif isinstance(target, torch.Tensor):
+                    target.copy_(v)
 
     def save(
         self,
@@ -156,30 +233,40 @@ class TrainerState:
         debug_pbar: RtlTqdm | tqdm | None = None,
         threads: int = 8,
     ) -> SaveFuture:
-        # Create a new process group so that we can overlap saves.
-        if dist.is_initialized():
-            with suppress_c_stdout():
-                grp = dist.new_group(backend="gloo", group_desc=path)
-            assert isinstance(grp, dist.ProcessGroup)
-        else:
-            grp = None
+        """Save this rank's shards to `path/rank_{r}.pt` in a background thread.
 
-        state = {
-            k: v.detach() if isinstance(v, torch.Tensor) else v
-            for k, v in self.state_dict().items()
-        }
-        # dcp.async_save's default writer uses a single IO thread, which
-        # can't keep up with per-step saves on slow filesystems (NFS).
-        fut = dcp.async_save(
-            state,
-            checkpoint_id=path,
-            storage_writer=dcp.FileSystemWriter(path, thread_count=threads),
-            process_group=grp,
-        )
-        assert isinstance(fut, Future)
+        DTensors are saved as their local shard only; every rank writes its own
+        complete file (params, opt state, buffers, RNG) to its own node's disk,
+        so no rank ever needs another node's filesystem. The GPU→CPU copy is
+        synchronous — with inplace training the next step mutates these tensors,
+        so staging must finish before this method returns. Only the disk write
+        is deferred, and it lands atomically via tmp + os.replace.
+        """
+        rank, world = _rank_and_world()
+
+        def _stage(v):
+            if isinstance(v, DTensor):
+                return v.to_local().detach().to("cpu", copy=True)
+            if isinstance(v, torch.Tensor):
+                return v.detach().to("cpu", copy=True)
+            return v
+
+        cpu_state = {k: _stage(v) for k, v in self.state_dict().items()}
+        cpu_state["__world_size"] = world
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        os.makedirs(path, exist_ok=True)
+        rank_path = _rank_file(path, rank)
+
+        def _write():
+            tmp_path = rank_path + ".tmp"
+            torch.save(cpu_state, tmp_path)
+            os.replace(tmp_path, rank_path)
+
+        fut = _save_executor().submit(_write)
         return SaveFuture(
             fut,
-            grp,
             debug_name=path if debug_pbar is not None else "",
             debug_pbar=debug_pbar,
         )
@@ -492,15 +579,17 @@ class Trainer:
         returns it for convenience.
         """
         ckpt_list = sorted_checkpoints(save_dir)
+        rank, _ = _rank_and_world()
 
-        # Filter out incomplete checkpoints (missing .metadata) and clean them up
-        valid_ckpts = []
-        for idx, path in ckpt_list:
-            metadata = os.path.join(path, ".metadata")
-            if os.path.exists(metadata):
-                valid_ckpts.append((idx, path))
-            else:
-                rmtree(path) if os.path.isdir(path) else os.remove(path)
+        # Filter out incomplete checkpoints (some rank's shard missing after a
+        # mid-save crash) and clean them up. Validity is agreed across ranks so
+        # everyone resumes from the same step; deletion is per-node since each
+        # node only sees its own shard files.
+        valid_ckpts, invalid_paths = _consensus_valid_checkpoints(ckpt_list, rank)
+        if _is_local_main(rank):
+            for path in invalid_paths:
+                if os.path.exists(path):
+                    rmtree(path) if os.path.isdir(path) else os.remove(path)
 
         # Load the most recent trainer state
         if valid_ckpts:
@@ -639,17 +728,16 @@ class Trainer:
         expected_idx = saved["expected_idx"]
         last_idx = saved["last_idx"]
 
-        # Filter to valid checkpoints we still need to process
-        valid_ckpts = []
-        for idx, path in ckpt_list:
-            if idx > expected_idx:
-                continue
-            metadata = os.path.join(path, ".metadata")
-            if os.path.exists(metadata):
-                valid_ckpts.append((idx, path))
-            elif os.path.isdir(path) and main:
-                rmtree(path)
-        ckpt_list = valid_ckpts
+        # Filter to valid checkpoints we still need to process. Validity needs
+        # cross-rank consensus (a crash can leave one node's shards missing);
+        # deletion is per-node because shards live on node-local disks.
+        rank, _ = _rank_and_world()
+        needed = [(idx, p) for idx, p in ckpt_list if idx <= expected_idx]
+        ckpt_list, invalid_paths = _consensus_valid_checkpoints(needed, rank)
+        if _is_local_main(rank):
+            for p in invalid_paths:
+                if os.path.isdir(p):
+                    rmtree(p)
 
         if not ckpt_list and expected_idx >= 0:
             raise RuntimeError(
@@ -910,9 +998,17 @@ class Trainer:
             if idx == expected_idx:
                 del ckpt_list[-1]
 
-                # Only delete on the main rank
-                if isinstance(ckpt, str) and main and ckpt not in preserve_paths:
-                    rmtree(ckpt) if os.path.isdir(ckpt) else os.remove(ckpt)
+                if isinstance(ckpt, str) and ckpt not in preserve_paths:
+                    # Unlike the old collective dcp.load, per-rank loads don't
+                    # synchronize — without a barrier the deleting rank can
+                    # race ahead and remove shards a sibling rank hasn't read.
+                    if dist.is_initialized():
+                        dist.barrier()
+
+                    # Delete once per node: shard files are node-local, so
+                    # global rank 0 cannot clean up the other nodes' copies.
+                    if _is_local_main(rank) and os.path.exists(ckpt):
+                        rmtree(ckpt) if os.path.isdir(ckpt) else os.remove(ckpt)
 
             # Step forward in training if needed
             next_save = (
@@ -945,7 +1041,18 @@ class Trainer:
                 if idx == next_save and idx < expected_idx:
                     # Switch from RAM disk to checkpoint dir if needed
                     num_copies = dist.get_world_size() if dist.is_initialized() else 1
-                    if psutil.virtual_memory().available > num_copies * state_size:
+                    fits_in_ram = (
+                        psutil.virtual_memory().available > num_copies * state_size
+                    )
+                    if dist.is_initialized():
+                        flag = torch.tensor(
+                            int(fits_in_ram),
+                            dtype=torch.int32,
+                            device="cuda" if torch.cuda.is_available() else "cpu",
+                        )
+                        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+                        fits_in_ram = bool(flag.item())
+                    if fits_in_ram:
                         ckpt_list.append((idx, fwd_state.to("cpu").detach_()))
                     else:
                         ckpt = os.path.join(ckpt_dir, f"step_{idx}.ckpt")
